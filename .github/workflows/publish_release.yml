@@ -1,0 +1,112 @@
+name: "publish-release"
+
+on:
+  push:
+    branches:
+      - "master"
+
+jobs:
+  npm-publish:
+    name: "Publish release"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      ### Prepare cargo & toolchains
+      - uses: actions/cache@v2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install Rust toolchain with wasm32-unknown-unknown
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          profile: minimal
+          override: true
+      - uses: actions-rs/cargo@v1
+        with:
+          toolchain: nightly
+          command: update
+          args: --aggressive
+
+      ### Calculate FINAL_VERSION
+      - name: Install jq & sponge
+        run: sudo apt-get update && sudo apt-get --yes --force-yes install jq moreutils
+
+      - name: Install cargo-show cargo-workspaces toml-cli
+        run: cargo install cargo-show cargo-workspaces toml-cli || true
+
+      - name: Calculate the version
+        run: |
+          # install semver and add it to PATH
+          yarn global add semver
+          PATH="$(yarn global bin):$PATH"
+
+          CARGO_TOML="engine/Cargo.toml"
+          # get package name from Cargo.toml
+          PKG_NAME="$(toml get "$CARGO_TOML" package.name | tr -d \")"
+          # get version from Cargo.toml
+          LOCAL_VERSION="$(toml get "$CARGO_TOML" package.version | tr -d \")"
+
+          # Define accumulator array variable
+          ALL_CRATES_VERSIONS=()
+
+          # For all crates in the workspace accumulate its max_version
+          for CRATE_NAME in $(cargo ws list)
+          do
+            CRATE_VERSION="$((cargo show --json "$CRATE_NAME" | jq -r .crate.max_version) 2>/dev/null || true)"
+            ALL_CRATES_VERSIONS+=($CRATE_VERSION)
+          done
+          # Take the highest version of all
+          MAX_CRATES_VERSION="$(semver -p ${ALL_CRATES_VERSIONS[@]} | tail -n1 || true)"
+          # Increment patch octet of the highest version
+          NEXT_CRATE_VERSION="$(semver --increment patch "${MAX_CRATES_VERSION}" || true)"
+
+          # take the highest version
+          MAX_VERSION="$(semver "$NEXT_CRATE_VERSION" "$LOCAL_VERSION" | tail -n1)"
+          echo "FINAL_VERSION=$MAX_VERSION" | tee -a $GITHUB_ENV
+          echo "PKG_NAME=$PKG_NAME" | tee -a $GITHUB_ENV
+
+      ### === Rust package release ===
+      - name: Login to crates.io
+        run: cargo login ${{ secrets.CRATES_IO_TOKEN }}
+
+      # Set the same version to all crates in the workspace and publish
+      - name: Publish to crates.io
+        run: cargo ws publish --no-git-commit --allow-dirty --yes custom "${{ env.FINAL_VERSION }}"
+
+      ### Create a pre-release
+      - name: Generate prerelease description
+        run: |
+          RELEASE_DESCRIPTION=""
+          for CRATE_NAME in $(cargo ws list)
+          do
+            LINK="https://crates.io/crates/$CRATE_NAME/${{ env.FINAL_VERSION }}"
+            TEXT="$CRATE_NAME"
+            ITEM="<li><a href=\"$LINK\">$TEXT</a></li>"
+            RELEASE_DESCRIPTION="${RELEASE_DESCRIPTION}${ITEM}"
+          done
+          RELEASE_DESCRIPTION="<h2>${{ env.FINAL_VERSION }} @ crates.io:</h2><ul>$RELEASE_DESCRIPTION</ul>"
+          echo "RELEASE_DESCRIPTION=$RELEASE_DESCRIPTION" | tee -a $GITHUB_ENV
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.FINAL_VERSION }}
+          release_name: Fluence Compute Engine ${{ env.FINAL_VERSION }}
+          body: |
+            ${{ env.RELEASE_DESCRIPTION }}
+          draft: false
+          prerelease: true
